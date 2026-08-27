@@ -52,7 +52,9 @@ def doctor_report() -> dict[str, object]:
         "faster_whisper": whisper_available,
     }
     return {
-        "ready_for_collection": bool(tools["yt-dlp"] and tools["ffmpeg"]),
+        "ready_for_collection": bool(
+            tools["yt-dlp"] and tools["ffmpeg"] and tools["ffprobe"]
+        ),
         "ready_for_transcription": whisper_available,
         "tools": tools,
     }
@@ -350,7 +352,35 @@ class EvidencePipeline:
         self.stage_status["video"] = candidates[0].name
         return candidates[0]
 
-    def _extract_audio(self, video_path: Path | None) -> Path | None:
+    @staticmethod
+    def _duration_is_complete(actual: float, expected: float) -> bool:
+        """允许封装与舍入造成的小偏差，但拒绝静默截断的音轨。"""
+        tolerance = max(2.0, expected * 0.005)
+        return actual + tolerance >= expected
+
+    def _probe_duration(self, path: Path, stage: str) -> float:
+        command = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ]
+        result = self._run(stage, command)
+        try:
+            duration = float(result.stdout.strip())
+        except ValueError as exc:
+            raise EvidenceError(f"无法读取媒体时长：{path}") from exc
+        if duration <= 0:
+            raise EvidenceError(f"媒体时长无效：{path}")
+        return duration
+
+    def _extract_audio(
+        self, video_path: Path | None, expected_duration: object = None
+    ) -> Path | None:
         if video_path is None:
             self.stage_status["audio"] = "skipped_without_video"
             return None
@@ -373,7 +403,23 @@ class EvidencePipeline:
             str(audio_path),
         ]
         self._run("audio", command)
-        self.stage_status["audio"] = audio_path.name
+        audio_duration = self._probe_duration(audio_path, "audio_duration")
+        try:
+            reference_duration = float(expected_duration)
+        except (TypeError, ValueError):
+            reference_duration = self._probe_duration(video_path, "video_duration")
+        if not self._duration_is_complete(audio_duration, reference_duration):
+            raise EvidenceError(
+                "音轨提取不完整："
+                f"得到 {audio_duration:.2f} 秒，预期约 {reference_duration:.2f} 秒；"
+                "请更换媒体音轨或重新采集，不能继续生成完整转写。"
+            )
+        self.stage_status["audio"] = {
+            "file": audio_path.name,
+            "duration_seconds": round(audio_duration, 3),
+            "reference_duration_seconds": round(reference_duration, 3),
+            "content_complete": True,
+        }
         return audio_path
 
     def _extract_frames(self, video_path: Path | None) -> None:
@@ -562,7 +608,7 @@ BV号：`{self.bvid}`
         metadata = self._collect_metadata()
         subtitles = self._collect_subtitles()
         video_path = self._download_video(metadata)
-        audio_path = self._extract_audio(video_path)
+        audio_path = self._extract_audio(video_path, metadata.get("duration"))
         self._extract_frames(video_path)
         self._prepare_transcript(subtitles, audio_path)
         self._write_analysis_template(metadata)

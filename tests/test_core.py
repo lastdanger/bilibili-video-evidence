@@ -47,6 +47,20 @@ def test_allowed_media_url(url: str, expected: bool) -> None:
 
 
 @pytest.mark.parametrize(
+    ("actual", "expected", "complete"),
+    [
+        (1649.36, 1650.0, True),
+        (1640.0, 1650.0, False),
+        (990.22, 1650.0, False),
+        (9.96, 10.0, True),
+    ],
+)
+def test_duration_is_complete(
+    actual: float, expected: float, complete: bool
+) -> None:
+    assert EvidencePipeline._duration_is_complete(actual, expected) is complete
+
+@pytest.mark.parametrize(
     ("seconds", "expected"),
     [
         (0, "00:00:00,000"),
