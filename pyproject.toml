@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bilibili-video-evidence"
+version = "0.1.0"
+description = "Auditable Bilibili video acquisition, transcription and evidence review pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "lastdanger" }]
+keywords = ["bilibili", "video", "transcription", "evidence", "yt-dlp", "whisper"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = []
+
+[project.optional-dependencies]
+transcribe = ["faster-whisper>=1.1.0,<2"]
+dev = ["pytest>=8.3,<9", "ruff>=0.9,<1"]
+
+[project.scripts]
+bvevidence = "bvevidence.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/lastdanger/bilibili-video-evidence"
+Issues = "https://github.com/lastdanger/bilibili-video-evidence/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bvevidence"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
