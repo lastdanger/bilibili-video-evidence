@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -104,6 +107,75 @@ class EvidencePipeline:
             return require_success(result, stage)
         return result
 
+    def _log_http(self, stage: str, url: str, status: str) -> None:
+        parsed = urllib.parse.urlsplit(url)
+        safe_url = urllib.parse.urlunsplit(
+            (parsed.scheme, parsed.netloc, parsed.path, "", "")
+        )
+        append_jsonl(
+            self.command_log,
+            {
+                "time_utc": datetime.now(UTC).isoformat(),
+                "stage": stage,
+                "transport": "HTTP_PUBLIC_API",
+                "url_without_query": safe_url,
+                "status": status,
+            },
+        )
+
+    def _public_request(self, url: str):
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 Chrome/139.0.0.0 Safari/537.36"
+                ),
+                "Referer": self.source_url,
+            },
+        )
+        return urllib.request.urlopen(request, timeout=60)  # noqa: S310
+
+    def _api_json(self, stage: str, endpoint: str, query: dict[str, object]) -> dict:
+        url = f"{endpoint}?{urllib.parse.urlencode(query)}"
+        try:
+            with self._public_request(url) as response:
+                payload = json.load(response)
+        except (OSError, ValueError, urllib.error.URLError) as exc:
+            self._log_http(stage, url, f"ERROR: {exc}")
+            raise EvidenceError(f"{stage} 公开 API 请求失败：{exc}") from exc
+        if payload.get("code") != 0 or not isinstance(payload.get("data"), dict):
+            message = payload.get("message") or payload.get("code")
+            self._log_http(stage, url, f"API_ERROR: {message}")
+            raise EvidenceError(f"{stage} 公开 API 返回错误：{message}")
+        self._log_http(stage, url, "OK")
+        return payload
+
+    def _collect_metadata_from_public_api(self) -> dict[str, object]:
+        payload = self._api_json(
+            "metadata_public_api",
+            "https://api.bilibili.com/x/web-interface/view",
+            {"bvid": self.bvid},
+        )
+        write_json(self.raw_dir / "bilibili.view.json", payload)
+        data = payload["data"]
+        pages = data.get("pages") or []
+        cid = pages[0].get("cid") if pages else data.get("cid")
+        metadata = {
+            "id": self.bvid,
+            "title": data.get("title"),
+            "uploader": (data.get("owner") or {}).get("name"),
+            "duration": data.get("duration"),
+            "description": data.get("desc"),
+            "timestamp": data.get("pubdate"),
+            "webpage_url": self.source_url,
+            "cid": cid,
+            "metadata_source": "BILIBILI_PUBLIC_API",
+        }
+        if not cid:
+            raise EvidenceError("公开视频元数据缺少 cid")
+        return metadata
+
     def _collect_metadata(self) -> dict[str, object]:
         command = [
             "yt-dlp",
@@ -113,14 +185,104 @@ class EvidencePipeline:
             *self._cookie_args(),
             self.source_url,
         ]
-        result = self._run("metadata", command)
-        try:
-            metadata = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            raise EvidenceError("yt-dlp 元数据不是有效 JSON") from exc
+        result = self._run("metadata", command, required=False)
+        if result.returncode == 0:
+            try:
+                metadata = json.loads(result.stdout)
+            except json.JSONDecodeError as exc:
+                raise EvidenceError("yt-dlp 元数据不是有效 JSON") from exc
+            source = "YT_DLP"
+        elif not self.options.cookies_from_browser:
+            metadata = self._collect_metadata_from_public_api()
+            source = "BILIBILI_PUBLIC_API_FALLBACK"
+        else:
+            raise EvidenceError(f"metadata失败：\n{result.stderr.strip()}")
         write_json(self.raw_dir / "metadata.json", metadata)
-        self.stage_status["metadata"] = "collected"
+        self.stage_status["metadata"] = {"status": "collected", "source": source}
         return metadata
+
+    @staticmethod
+    def _allowed_media_url(url: str) -> bool:
+        parsed = urllib.parse.urlsplit(url)
+        hostname = (parsed.hostname or "").lower()
+        return parsed.scheme == "https" and (
+            hostname.endswith(".bilivideo.com")
+            or hostname == "bilivideo.com"
+            or hostname.endswith(".bilibili.com")
+            or hostname == "bilibili.com"
+        )
+
+    def _download_public_stream(
+        self, stage: str, candidates: list[str], destination: Path
+    ) -> None:
+        errors: list[str] = []
+        for url in candidates:
+            if not self._allowed_media_url(url):
+                errors.append("拒绝非 B 站 HTTPS 媒体地址")
+                continue
+            try:
+                with self._public_request(url) as source:
+                    with destination.open("wb") as target:
+                        shutil.copyfileobj(source, target)
+                self._log_http(stage, url, "OK")
+                return
+            except (OSError, urllib.error.URLError) as exc:
+                destination.unlink(missing_ok=True)
+                self._log_http(stage, url, f"ERROR: {exc}")
+                errors.append(str(exc))
+        raise EvidenceError(f"{stage} 所有公开媒体地址均下载失败：{' | '.join(errors)}")
+
+    @staticmethod
+    def _stream_urls(stream: dict) -> list[str]:
+        primary = stream.get("baseUrl") or stream.get("base_url")
+        backups = stream.get("backupUrl") or stream.get("backup_url") or []
+        return [url for url in [primary, *backups] if isinstance(url, str)]
+
+    def _download_video_from_public_api(self, metadata: dict[str, object]) -> Path:
+        payload = self._api_json(
+            "playurl_public_api",
+            "https://api.bilibili.com/x/player/playurl",
+            {
+                "bvid": self.bvid,
+                "cid": metadata["cid"],
+                "qn": 80,
+                "fnval": 4048,
+                "fourk": 1,
+            },
+        )
+        write_json(self.raw_dir / "bilibili.playurl.json", payload)
+        dash = payload["data"].get("dash") or {}
+        video_streams = dash.get("video") or []
+        audio_streams = dash.get("audio") or []
+        if not video_streams or not audio_streams:
+            raise EvidenceError("公开播放接口没有返回可用的 DASH 音视频流")
+        video_stream = max(video_streams, key=lambda item: item.get("bandwidth") or 0)
+        audio_stream = max(audio_streams, key=lambda item: item.get("bandwidth") or 0)
+        video_part = self.raw_dir / "video-only.m4s"
+        audio_part = self.raw_dir / "audio-only.m4s"
+        self._download_public_stream(
+            "video_stream_public_api", self._stream_urls(video_stream), video_part
+        )
+        self._download_public_stream(
+            "audio_stream_public_api", self._stream_urls(audio_stream), audio_part
+        )
+        output = self.raw_dir / "video.mp4"
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(video_part),
+            "-i",
+            str(audio_part),
+            "-c",
+            "copy",
+            str(output),
+        ]
+        self._run("video_mux_public_api", command)
+        return output
 
     def _collect_subtitles(self) -> list[Path]:
         command = [
@@ -150,7 +312,7 @@ class EvidencePipeline:
         }
         return subtitles
 
-    def _download_video(self) -> Path | None:
+    def _download_video(self, metadata: dict[str, object]) -> Path | None:
         if self.options.skip_video:
             self.stage_status["video"] = "skipped"
             return None
@@ -168,7 +330,16 @@ class EvidencePipeline:
             *self._cookie_args(),
             self.source_url,
         ]
-        self._run("video", command)
+        result = self._run("video", command, required=False)
+        if result.returncode != 0 and not self.options.cookies_from_browser:
+            video_path = self._download_video_from_public_api(metadata)
+            self.stage_status["video"] = {
+                "file": video_path.name,
+                "source": "BILIBILI_PUBLIC_API_FALLBACK",
+            }
+            return video_path
+        if result.returncode != 0:
+            raise EvidenceError(f"video失败：\n{result.stderr.strip()}")
         candidates = sorted(
             path
             for path in self.raw_dir.glob("video.*")
@@ -390,7 +561,7 @@ BV号：`{self.bvid}`
         self._prepare()
         metadata = self._collect_metadata()
         subtitles = self._collect_subtitles()
-        video_path = self._download_video()
+        video_path = self._download_video(metadata)
         audio_path = self._extract_audio(video_path)
         self._extract_frames(video_path)
         self._prepare_transcript(subtitles, audio_path)

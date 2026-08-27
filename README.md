@@ -13,6 +13,7 @@
 ## 功能
 
 - 使用 `yt-dlp` 获取公开视频、音轨、公开字幕和元数据；
+- 遇到未登录网页请求的 HTTP 412 时，自动回退到 B 站公开 API，不读取浏览器 Cookie；
 - 视频没有字幕时，可选用 `faster-whisper` 本地转写；
 - 使用 FFmpeg 提取场景变化关键帧和 16 kHz 单声道音轨；
 - 保存命令、工具版本、原始元数据和文件 SHA-256；
@@ -69,6 +70,11 @@ bvevidence collect "BV1vg8S6yEff" \
   --device cpu \
   --compute-type int8
 ```
+
+`collect` 默认先使用 `yt-dlp`。若公开视频的网页请求返回 HTTP 412，工具会自动使用
+B 站公开元数据与播放接口取得 `cid` 和 DASH 流，并只接受 `bilibili.com` 或
+`bilivideo.com` 的 HTTPS 媒体地址。公开 API 原始响应会保存在 `raw/` 中供审计。
+这一回退不依赖登录态。
 
 若视频需要当前浏览器登录态：
 

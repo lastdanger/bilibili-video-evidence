@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from bvevidence.core import artifact_hashes, canonical_url, extract_bvid, srt_timestamp
-from bvevidence.pipeline import verify_run
+from bvevidence.pipeline import EvidencePipeline, verify_run
 from bvevidence.transcribe import TranscriptSegment, write_srt
 
 
@@ -30,6 +30,20 @@ def test_extract_bvid_rejects_unknown_value() -> None:
 def test_canonical_url_discards_tracking_parameters() -> None:
     source = "https://www.bilibili.com/video/BV1vg8S6yEff?share_source=WEIXIN"
     assert canonical_url(source) == "https://www.bilibili.com/video/BV1vg8S6yEff"
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://upos-sz-mirrorcos.bilivideo.com/path/video.m4s", True),
+        ("https://api.bilibili.com/path/audio.m4s", True),
+        ("http://upos-sz-mirrorcos.bilivideo.com/path/video.m4s", False),
+        ("https://bilivideo.com.evil.example/path/video.m4s", False),
+        ("https://example.com/video.m4s", False),
+    ],
+)
+def test_allowed_media_url(url: str, expected: bool) -> None:
+    assert EvidencePipeline._allowed_media_url(url) is expected
 
 
 @pytest.mark.parametrize(
